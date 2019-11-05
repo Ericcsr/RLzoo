@@ -77,6 +77,10 @@ class TRPO:
         self.critic_opt, = optimizers_list
         self.old_dist = make_dist(self.actor.action_space)
 
+        self.batch_counter = 0
+        self.buffer_s, self.buffer_a, self.buffer_r, = [], [], []
+        self.batch_s, self.batch_a, self.batch_r = [], [], []
+
     @staticmethod
     def flat_concat(xs):
         """
@@ -292,24 +296,53 @@ class TRPO:
             hvp += self.damping_coeff * v_ph
         return hvp
 
-    def update(self, bs, ba, br, train_critic_iters, backtrack_iters, backtrack_coeff):
+    def update(self, train_critic_iters, backtrack_iters, backtrack_coeff):
         """
         update trpo
         :return:
         """
-        adv = self.cal_adv(bs, br)
-        _ = self.actor(bs)
-        oldpi_prob = tf.exp(self.actor.policy_dist.logp(ba))
+        adv = self.cal_adv(self.batch_s, self.batch_r)
+        # adv = (adv - adv.mean())/(adv.std()+1e-6)  # adv norm, sometimes helpful
+
+        _ = self.actor(self.batch_s)
+        oldpi_prob = tf.exp(self.actor.policy_dist.logp(self.batch_a))
         oldpi_prob = tf.stop_gradient(oldpi_prob)
 
         oldpi_param = self.actor.policy_dist.get_param()
         oldpi_param = tf.stop_gradient(oldpi_param)
         self.old_dist.set_param(oldpi_param)
 
-        self.a_train(bs, ba, adv, oldpi_prob, backtrack_iters, backtrack_coeff)
+        self.a_train(self.batch_s, self.batch_a, adv, oldpi_prob, backtrack_iters, backtrack_coeff)
 
         for _ in range(train_critic_iters):
-            self.c_train(br, bs)
+            self.c_train(self.batch_r, self.batch_s)
+
+        self.batch_counter = 0
+        self.buffer_s, self.buffer_a, self.buffer_r, = [], [], []
+        self.batch_s, self.batch_a, self.batch_r = [], [], []
+
+    def store_transition(self, s, a, r):
+        self.batch_counter += 1
+        self.buffer_s.append(s)
+        self.buffer_a.append(a)
+        self.buffer_r.append(r)
+
+    def finish_path(self, s_, gamma):
+        try:
+            v_s_ = self.get_v(s_)
+        except:
+            v_s_ = self.get_v(s_[np.newaxis, :])   # for raw-pixel input
+        discounted_r = []
+        for r in self.buffer_r[::-1]:
+            v_s_ = r + gamma * v_s_
+            discounted_r.append(v_s_)
+        discounted_r.reverse()
+        bs = self.buffer_s if len(self.buffer_s[0].shape)>1 else np.vstack(self.buffer_s) # no vstack for raw-pixel input
+        ba, br = np.vstack(self.buffer_a), np.array(discounted_r)[:, np.newaxis]
+        self.batch_s.extend(bs)
+        self.batch_a.extend(ba)
+        self.batch_r.extend(br)
+        self.buffer_s, self.buffer_a, self.buffer_r, = [], [], []
 
     def learn(self, env, train_episodes=200, test_episodes=100, max_steps=200, save_interval=10,
               gamma=0.9, mode='train', render=False, batch_size=32, backtrack_iters=10, backtrack_coeff=0.8,
@@ -337,7 +370,6 @@ class TRPO:
             reward_buffer = []
             for ep in range(1, train_episodes + 1):
                 s = env.reset()
-                buffer_s, buffer_a, buffer_r = [], [], []
                 ep_rs_sum = 0
                 for t in range(max_steps):  # in one episode
                     if render:
@@ -345,28 +377,19 @@ class TRPO:
                     a = self.get_action(s)
 
                     s_, r, done, _ = env.step(a)
-                    buffer_s.append(s)
-                    buffer_a.append(a)
-                    buffer_r.append(r)
+                    self.store_transition(s, a, r)
                     s = s_
                     ep_rs_sum += r
 
-                    # update ppo
-                    if (t + 1) % batch_size == 0 or t == max_steps - 1 or done:
-                        try:
-                            v_s_ = self.get_v(s_)
-                        except:
-                            v_s_ = self.get_v(s_[np.newaxis, :])  # for raw-pixel input
-                        discounted_r = []
-                        for r in buffer_r[::-1]:
-                            v_s_ = r + gamma * v_s_
-                            discounted_r.append(v_s_)
-                        discounted_r.reverse()
-                        bs = buffer_s if len(buffer_s[0].shape) > 1 else np.vstack(
-                            buffer_s)  # no vstack for raw-pixel input
-                        ba, br = np.vstack(buffer_a), np.array(discounted_r)[:, np.newaxis]
-                        buffer_s, buffer_a, buffer_r = [], [], []
-                        self.update(bs, ba, br, train_critic_iters, backtrack_iters, backtrack_coeff)
+                    if t == max_steps - 1 or done:
+                        self.finish_path(s_, gamma)
+
+                    # update
+                    if self.batch_counter % batch_size == 0:
+                        if len(self.buffer_a):
+                            self.finish_path(s_, gamma)
+                        self.update(train_critic_iters, backtrack_iters, backtrack_coeff)
+
                     if done:
                         break
 
