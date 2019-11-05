@@ -284,9 +284,35 @@ class Worker(object):
     def __init__(self, wid, env):
         self.wid = wid
         self.env = env
-        # self.env.seed(wid * 100 + RANDOMSEED)
         global GLOBAL_PPO
         self.ppo = GLOBAL_PPO
+
+        self.batch_counter = 0
+        self.buffer_s, self.buffer_a, self.buffer_r, = [], [], []
+        self.batch_s, self.batch_a, self.batch_r = [], [], []
+
+    def store_transition(self, s, a, r):
+        self.batch_counter += 1
+        self.buffer_s.append(s)
+        self.buffer_a.append(a)
+        self.buffer_r.append(r)
+
+    def finish_path(self, s_, gamma):
+        try:
+            v_s_ = self.ppo.get_v(s_)
+        except:
+            v_s_ = self.ppo.get_v(s_[np.newaxis, :])   # for raw-pixel input
+        discounted_r = []
+        for r in self.buffer_r[::-1]:
+            v_s_ = r + gamma * v_s_
+            discounted_r.append(v_s_)
+        discounted_r.reverse()
+        bs = self.buffer_s if len(self.buffer_s[0].shape)>1 else np.vstack(self.buffer_s) # no vstack for raw-pixel input
+        ba, br = np.vstack(self.buffer_a), np.array(discounted_r)[:, np.newaxis]
+        self.batch_s.extend(bs)
+        self.batch_a.extend(ba)
+        self.batch_r.extend(br)
+        self.buffer_s, self.buffer_a, self.buffer_r, = [], [], []
 
     def work(self):
         """
@@ -298,45 +324,40 @@ class Worker(object):
         while not COORD.should_stop():
             s = self.env.reset()
             ep_r = 0
-            buffer_s, buffer_a, buffer_r = [], [], []
             for t in range(1, EP_LEN + 1):
                 if not ROLLING_EVENT.is_set():  # while global PPO is updating
                     ROLLING_EVENT.wait()  # wait until PPO is updated
-                    buffer_s, buffer_a, buffer_r = [], [], []  # clear history buffer, use new policy to collect data
+
+                    # clear history buffer, use new policy to collect data
+                    self.batch_counter = 0
+                    self.buffer_s, self.buffer_a, self.buffer_r, = [], [], []
+                    self.batch_s, self.batch_a, self.batch_r = [], [], []
+
                 a = self.ppo.get_action(s)
                 for step in range(EP_LEN):
                     if RENDER:
                         self.env.render()
                 s_, r, done, _ = self.env.step(a)
-                buffer_s.append(s)
-                buffer_a.append(a)
-                buffer_r.append(r)
+                self.store_transition(s, a, r)
                 s = s_
                 ep_r += r
 
                 GLOBAL_UPDATE_COUNTER += 1  # count to minimum batch size, no need to wait other workers
-                if t == EP_LEN - 1 or GLOBAL_UPDATE_COUNTER >= MIN_BATCH_SIZE or done:
-                    try:
-                        v_s_ = self.ppo.get_v(s_)
-                    except:
-                        v_s_ = self.ppo.get_v(s_[np.newaxis, :])  # for raw-pixel input
-                    discounted_r = []  # compute discounted reward
-                    for r in buffer_r[::-1]:
-                        v_s_ = r + GAMMA * v_s_
-                        discounted_r.append(v_s_)
-                    discounted_r.reverse()
-                    bs = buffer_s if len(buffer_s[0].shape) > 1 else np.vstack(
-                        buffer_s)  # no vstack for raw-pixel input
-                    ba, br = np.vstack(buffer_a), np.array(discounted_r)[:, np.newaxis]
-                    buffer_s, buffer_a, buffer_r = [], [], []
-                    QUEUE.put((bs, ba, br))  # put data in the queue
-                    if GLOBAL_UPDATE_COUNTER >= MIN_BATCH_SIZE:
-                        ROLLING_EVENT.clear()  # stop collecting data
-                        UPDATE_EVENT.set()  # globalPPO update
+                if t == EP_LEN - 1 or done:
+                    self.finish_path(s_, GAMMA)
 
-                    if GLOBAL_EP >= EP_MAX:  # stop training
-                        COORD.request_stop()
-                        break
+                if GLOBAL_UPDATE_COUNTER >= MIN_BATCH_SIZE:
+                    if len(self.buffer_a):
+                        self.finish_path(s_, GAMMA)
+
+                    QUEUE.put((self.batch_s, self.batch_a, self.batch_r))  # put data in the queue
+
+                    ROLLING_EVENT.clear()  # stop collecting data
+                    UPDATE_EVENT.set()  # globalPPO update
+
+                if GLOBAL_EP >= EP_MAX:  # stop training
+                    COORD.request_stop()
+                    break
                 if done:
                     break
 
