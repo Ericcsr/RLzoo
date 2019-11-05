@@ -61,6 +61,10 @@ class PPO_CLIP(object):
 
         self.critic_opt, self.actor_opt = optimizers_list
 
+        self.batch_counter = 0
+        self.buffer_s, self.buffer_a, self.buffer_r, = [], [], []
+        self.batch_s, self.batch_a, self.batch_r = [], [], []
+
     def a_train(self, tfs, tfa, tfadv, oldpi_prob):
         """
         Update policy network
@@ -111,28 +115,32 @@ class PPO_CLIP(object):
         advantage = tfdc_r - self.critic(tfs)
         return advantage.numpy()
 
-    def update(self, s, a, r, a_update_steps, c_update_steps):
+    def update(self, a_update_steps, c_update_steps):
         """
-        Update parameter with the constraint of KL divergent
-        :param s: state
-        :param a: act
-        :param r: reward
-        :return: None
+        update function
+        :param a_update_steps: actor update iteration steps
+        :param c_update_steps: critic update iteration steps
+        :return:
         """
-        adv = self.cal_adv(s, r)
+
+        adv = self.cal_adv(self.batch_s, self.batch_r)
         # adv = (adv - adv.mean())/(adv.std()+1e-6)  # adv norm, sometimes helpful
 
-        _ = self.actor(s)
-        oldpi_prob = tf.exp(self.actor.policy_dist.logp(a))
+        _ = self.actor(self.batch_s)
+        oldpi_prob = tf.exp(self.actor.policy_dist.logp(self.batch_a))
         oldpi_prob = tf.stop_gradient(oldpi_prob)
 
         # update actor
         for _ in range(a_update_steps):
-            self.a_train(s, a, adv, oldpi_prob)
+            self.a_train(self.batch_s, self.batch_a, adv, oldpi_prob)
 
         # update critic
         for _ in range(c_update_steps):
-            self.c_train(r, s)
+            self.c_train(self.batch_r, self.batch_s)
+
+        self.batch_counter = 0
+        self.buffer_s, self.buffer_a, self.buffer_r, = [], [], []
+        self.batch_s, self.batch_a, self.batch_r = [], [], []
 
     def get_action(self, s):
         """
@@ -177,6 +185,29 @@ class PPO_CLIP(object):
         load_model(self.actor, 'actor', self.name, )
         load_model(self.critic, 'critic', self.name, )
 
+    def store_transition(self, s, a, r):
+        self.batch_counter += 1
+        self.buffer_s.append(s)
+        self.buffer_a.append(a)
+        self.buffer_r.append(r)
+
+    def finish_path(self, s_, gamma):
+        try:
+            v_s_ = self.get_v(s_)
+        except:
+            v_s_ = self.get_v(s_[np.newaxis, :])   # for raw-pixel input
+        discounted_r = []
+        for r in self.buffer_r[::-1]:
+            v_s_ = r + gamma * v_s_
+            discounted_r.append(v_s_)
+        discounted_r.reverse()
+        bs = self.buffer_s if len(self.buffer_s[0].shape)>1 else np.vstack(self.buffer_s) # no vstack for raw-pixel input
+        ba, br = np.vstack(self.buffer_a), np.array(discounted_r)[:, np.newaxis]
+        self.batch_s.extend(bs)
+        self.batch_a.extend(ba)
+        self.batch_r.extend(br)
+        self.buffer_s, self.buffer_a, self.buffer_r, = [], [], []
+
     def learn(self, env, train_episodes=200, test_episodes=100, max_steps=200, save_interval=10,
               gamma=0.9, mode='train', render=False, batch_size=32, a_update_steps=10, c_update_steps=10):
         """
@@ -185,11 +216,11 @@ class PPO_CLIP(object):
         :param train_episodes: total number of episodes for training
         :param test_episodes: total number of episodes for testing
         :param max_steps: maximum number of steps for one episode
-        :param save_interval: timesteps for saving
+        :param save_interval: time steps for saving
         :param gamma: reward discount factor
         :param mode: train or test
         :param render: render each step
-        :param batch_size: udpate batchsize
+        :param batch_size: update batch size
         :param a_update_steps: actor update iteration steps
         :param c_update_steps: critic update iteration steps
         :return: None
@@ -201,7 +232,6 @@ class PPO_CLIP(object):
             reward_buffer = []
             for ep in range(1, train_episodes + 1):
                 s = env.reset()
-                buffer_s, buffer_a, buffer_r = [], [], []
                 ep_rs_sum = 0
                 for t in range(max_steps):  # in one episode
                     if render:
@@ -209,27 +239,19 @@ class PPO_CLIP(object):
                     a = self.get_action(s)
 
                     s_, r, done, _ = env.step(a)
-                    buffer_s.append(s)
-                    buffer_a.append(a)
-                    buffer_r.append(r)
+                    self.store_transition(s, a, r)
                     s = s_
                     ep_rs_sum += r
 
+                    if t == max_steps - 1 or done:
+                        self.finish_path(s_, gamma)
+
                     # update ppo
-                    if (t + 1) % batch_size == 0 or t == max_steps - 1 or done:
-                        try:
-                            v_s_ = self.get_v(s_)
-                        except:
-                            v_s_ = self.get_v(s_[np.newaxis, :])   # for raw-pixel input
-                        discounted_r = []
-                        for r in buffer_r[::-1]:
-                            v_s_ = r + gamma * v_s_
-                            discounted_r.append(v_s_)
-                        discounted_r.reverse()
-                        bs = buffer_s if len(buffer_s[0].shape)>1 else np.vstack(buffer_s) # no vstack for raw-pixel input
-                        ba, br = np.vstack(buffer_a), np.array(discounted_r)[:, np.newaxis]
-                        buffer_s, buffer_a, buffer_r = [], [], []
-                        self.update(bs, ba, br, a_update_steps, c_update_steps)
+                    if self.batch_counter % batch_size == 0:
+                        if len(self.buffer_a):
+                            self.finish_path(s_, gamma)
+                        self.update(a_update_steps, c_update_steps)
+
                     if done:
                         break
 
@@ -253,12 +275,12 @@ class PPO_CLIP(object):
             self.load_ckpt()
             for eps in range(test_episodes):
                 ep_rs_sum = 0
-                s = env.reset()
+                state = env.reset()
                 for step in range(max_steps):
                     if render:
                         env.render()
-                    action = self.get_action_greedy(s)
-                    s, reward, done, info = env.step(action)
+                    action = self.get_action_greedy(state)
+                    state, reward, done, info = env.step(action)
                     ep_rs_sum += reward
                     if done:
                         break
